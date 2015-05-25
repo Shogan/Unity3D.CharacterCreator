@@ -1,6 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using Amazon;
+using Amazon.CognitoIdentity;
+using Amazon.DynamoDBv2;
+using Amazon.DynamoDBv2.DataModel;
+using Amazon.DynamoDBv2.DocumentModel;
+using Amazon.DynamoDBv2.Model;
+using Assets.CharacterCreatorAWSDynamoDB.Scripts;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -47,7 +54,14 @@ public class CharacterCreator : MonoBehaviour
     public InputField dexterityInput;
     public InputField intelligenceInput;
 
-    // Add AWS specific variables here.
+    public string cognitoIdentityPoolString;
+    
+    private CognitoAWSCredentials credentials;
+    private IAmazonDynamoDB _client;
+    private DynamoDBContext _context;
+
+    private List<CharacterEntity> characterEntities = new List<CharacterEntity>();
+    private int currentCharacterIndex;
 
     private string selectedName = string.Empty;
     private string selectedBody = string.Empty;
@@ -74,11 +88,26 @@ public class CharacterCreator : MonoBehaviour
     /// </summary>
     private Sprite[] allSprites;
 
+    private DynamoDBContext Context
+    {
+        get
+        {
+            if (_context == null)
+                _context = new DynamoDBContext(_client);
+
+            return _context;
+        }
+    }
+
     void Awake()
     {
         // Setup listeners for some buttons in the scene.
 
-        
+        createOperation.onClick.AddListener(CreateCharacterInTable);
+        refreshOperation.onClick.AddListener(FetchAllCharactersFromAWS);
+
+        NextCharacterButton.onClick.AddListener(CycleNextCharacter);
+        PrevCharacterButton.onClick.AddListener(CyclePrevCharacter);
         
         nextHair.onClick.AddListener(() => CycleNextClothing(nextHair));
         prevHair.onClick.AddListener(() => CyclePrevClothing(prevHair));
@@ -263,6 +292,38 @@ public class CharacterCreator : MonoBehaviour
         }
     }
 
+    private void CycleNextCharacter()
+    {
+        if (characterEntities.Count <= 0) return;
+
+        if (currentCharacterIndex < characterEntities.Count - 1)
+        {
+            currentCharacterIndex++;
+            LoadCharacter(characterEntities[currentCharacterIndex]);
+        }
+        else
+        {
+            LoadCharacter(characterEntities.First());
+            currentCharacterIndex = 0;
+        }
+    }
+
+    private void CyclePrevCharacter()
+    {
+        if (characterEntities.Count <= 0) return;
+
+        if (currentCharacterIndex > 0)
+        {
+            currentCharacterIndex--;
+            LoadCharacter(characterEntities[currentCharacterIndex]);
+        }
+        else
+        {
+            LoadCharacter(characterEntities.Last());
+            currentCharacterIndex = characterEntities.Count - 1;
+        }
+    }
+
     // Use this for initialization
 	void Start ()
 	{
@@ -275,9 +336,154 @@ public class CharacterCreator : MonoBehaviour
 	    selectedShirt = selectedShirtImage.overrideSprite.name;
 	    selectedPants = selectedPantsImage.overrideSprite.name;
 	    selectedShoes = selectedShoesImage.overrideSprite.name;
+
+        // Setup our credentials which will use our Cognito identity pool to hand us short-term session credentials,
+        // giving us access to what we have provided access to with our IAM role policies, in this case, access to our
+        // DynamoDB table.
+        credentials = new CognitoAWSCredentials(cognitoIdentityPoolString, RegionEndpoint.USEast1);
+        credentials.GetIdentityIdAsync(delegate(AmazonCognitoIdentityResult<string> result)
+        {
+            if (result.Exception != null)
+            {
+                Debug.LogError("exception hit: " + result.Exception.Message);
+            }
+
+            // Create a DynamoDB client, passing in our credentials from Cognito.
+            var ddbClient = new AmazonDynamoDBClient(credentials, RegionEndpoint.USEast1);
+
+            resultText.text += ("\n*** Retrieving table information ***\n");
+
+            // Create a DescribeTableRequest to get information about our table, and ensure we can access it.
+            var request = new DescribeTableRequest
+            {
+                TableName = @"CharacterCreator"
+            };
+
+            ddbClient.DescribeTableAsync(request, (ddbresult) =>
+            {
+                if (result.Exception != null)
+                {
+                    resultText.text += result.Exception.Message;
+                    Debug.Log(result.Exception);
+                    return;
+                }
+
+                var response = ddbresult.Response;
+                
+                // Debug information
+                TableDescription description = response.Table;
+                resultText.text += ("Name: " + description.TableName + "\n");
+                resultText.text += ("# of items: " + description.ItemCount + "\n");
+                resultText.text += ("Provision Throughput (reads/sec): " + description.ProvisionedThroughput.ReadCapacityUnits + "\n");
+                resultText.text += ("Provision Throughput (reads/sec): " + description.ProvisionedThroughput.WriteCapacityUnits + "\n");
+
+            }, null);
+
+            // Set our _client field to the dynamoDB client.
+            _client = ddbClient;
+
+            // Fetch any stored characters from the DB
+            FetchAllCharactersFromAWS();
+
+        });
 	}
 
-    // Update is called once per frame
+    private void LoadCharacter(CharacterEntity characterEntity)
+    {
+        // Update the selected body component values stored as field values
+        selectedBody = characterEntity.BodySpriteName;
+        selectedFace = characterEntity.FaceSpriteName;
+        selectedHair = characterEntity.HairSpriteName;
+        selectedShirt = characterEntity.ShirtSpriteName;
+        selectedPants = characterEntity.PantsSpriteName;
+        selectedShoes = characterEntity.ShoesSpriteName;
+
+        // Update the character component images with those of the loaded character entity.
+        selectedHairImage.overrideSprite = allSprites.First(sprite => sprite.name == characterEntity.HairSpriteName);
+        selectedFaceImage.overrideSprite = allSprites.First(sprite => sprite.name == characterEntity.FaceSpriteName);
+        selectedBodyImage.overrideSprite = allSprites.First(sprite => sprite.name == characterEntity.BodySpriteName);
+        selectedShirtImage.overrideSprite = allSprites.First(sprite => sprite.name == characterEntity.ShirtSpriteName);
+        selectedPantsImage.overrideSprite = allSprites.First(sprite => sprite.name == characterEntity.PantsSpriteName);
+        selectedShoesImage.overrideSprite = allSprites.First(sprite => sprite.name == characterEntity.ShoesSpriteName);
+        
+        // Update character stats with those from the loaded entity.
+        characterNameText.text = characterEntity.Name;
+        nameInput.text = characterEntity.Name;
+        ageInput.text = characterEntity.Age.ToString();
+        strengthInput.text = characterEntity.Strength.ToString();
+        dexterityInput.text = characterEntity.Dexterity.ToString();
+        intelligenceInput.text = characterEntity.Intelligence.ToString();
+    }
+
+    private void FetchAllCharactersFromAWS()
+    {
+        resultText.text = "\n***LoadTable***";
+        Table.LoadTableAsync(_client, "CharacterCreator", (loadTableResult) =>
+        {
+            if (loadTableResult.Exception != null)
+            {
+                resultText.text += "\n failed to load characters table";
+            }
+            else
+            {
+                try
+                {
+                    var context = Context;
+
+                    // Note scan is pretty slow for large datasets compared to a query, as we are not searching on the index.
+                    var search = context.ScanAsync<CharacterEntity>(new ScanCondition("Age", ScanOperator.GreaterThan, 0));
+                    search.GetRemainingAsync(result =>
+                    {
+                        if (result.Exception == null)
+                        {
+                            characterEntities = result.Result;
+                            
+                            // Load the first character into the character display
+                            if (characterEntities.Count > 0) LoadCharacter(characterEntities.First());
+                        }
+                        else
+                        {
+                            Debug.LogError("Failed to get async table scan results: " + result.Exception.Message);
+                        }
+                    }, null);
+                }
+                catch (AmazonDynamoDBException exception)
+                {
+                    Debug.Log(string.Concat("Exception fetching characters from table: {0}", exception.Message));
+                    Debug.Log(string.Concat("Error code: {0}, error type: {1}", exception.ErrorCode, exception.ErrorType));
+                }
+
+            }
+        });
+    }
+
+    private void CreateCharacterInTable()
+    {
+        var newCharacter = new CharacterEntity
+        {
+            CharacterID = Guid.NewGuid().ToString(),
+            BodySpriteName = selectedBody,
+            FaceSpriteName = selectedFace,
+            ShirtSpriteName = selectedShirt,
+            HairSpriteName = selectedHair,
+            PantsSpriteName = selectedPants,
+            ShoesSpriteName = selectedShoes,
+            Name = nameInput.text,
+            Age = Int32.Parse(ageInput.text),
+            Dexterity = Int32.Parse(dexterityInput.text),
+            Intelligence = Int32.Parse(intelligenceInput.text),
+            Strength = Int32.Parse(strengthInput.text)
+        };
+
+        // Save the character asynchronously to the table.
+        Context.SaveAsync(newCharacter, (result) =>
+        {
+            if (result.Exception == null)
+                resultText.text += @"character saved";
+        });
+    }
+    
+	// Update is called once per frame
 	void Update () {
 	
 	}
